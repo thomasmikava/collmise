@@ -16,18 +16,18 @@ export const collmise: CollmiseCreatorFn = (options = {}) => {
 };
 
 export interface CollmiseOptions<Id, RawData, Data = RawData> {
-  /** default: true */
+  /** @defaultValue true */
   useCache?: boolean;
-  /** default: true */
+  /** @defaultValue true */
   consistentDataOnSameIds?: boolean;
-  /** default: 1 */
+  /** @defaultValue 1 */
   collectingTimeoutMS?: number;
-  /** default: true */
+  /** @defaultValue true */
   joinConcurrentRequests?: boolean;
-  /** default: 0 */
+  /** @defaultValue 0 */
   responseCacheTimeoutMS?: number;
   serializeId?: (id: Id) => string | number | symbol;
-  /** default: false */
+  /** @defaultValue false */
   alwaysCallDirectRequest?: boolean;
   findCachedData?: (
     id: Id
@@ -120,7 +120,7 @@ interface QueuedCluster<Id, RawData, Data> {
 
 const collmiseHelper = <Id, RawData, Data, Collectors extends AnyCollectors>(
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ): Collmise<Id, RawData, Data, Collectors> => {
@@ -190,7 +190,7 @@ function isNonEmptyData<T>(value: T): value is Exclude<T, null | undefined> {
 
 const getOnFn = <Id, RawData, Data, Collectors extends AnyCollectors>(
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ) => {
@@ -269,7 +269,7 @@ const getFoundPromiseOnKey = <Id, RawData, Data>(
 const getSingleRequest = <Id, RawData, Data>(
   id: Id,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>,
   skipCallingOne: boolean
@@ -304,7 +304,7 @@ const getSingleRequest = <Id, RawData, Data>(
       const cachedData = await options.findCachedData(id);
       if (isNotEmpty(cachedData)) {
         hasFoundData = true;
-        foundedDataPromsie = dataTransformer(cachedData!);
+        foundedDataPromsie = dataTransformer(cachedData!, id);
       }
     }
     if (!hasFoundData) {
@@ -458,7 +458,7 @@ const transformFoundedOneData = <Id, RawData, Data = RawData>(
   id: Id,
   oneData: RawData | Data | null | undefined,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   }
 ) => {
   const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
@@ -469,7 +469,7 @@ const transformFoundedOneData = <Id, RawData, Data = RawData>(
     ? options.dataTransformer
     : rawData => rawData as Data;
   if (isNotEmpty(oneData)) {
-    return dataTransformer(oneData!);
+    return dataTransformer(oneData!, id);
   } else {
     const getNotFoundError =
       options.getNotFoundError || defaultGetNotFoundError;
@@ -485,13 +485,13 @@ const sendSingle = async <Id, RawData, Data>(
   id: Id,
   key: string,
   options: CollmiseOptions<Id, RawData, Data>,
-  dataTransformer: (data: RawData | Data) => Data,
+  dataTransformer: (data: RawData | Data, id: Id) => Data,
   getPromise: (id: Id) => RawData | Data | Promise<RawData | Data>,
   inner: InnerOptions<Id, RawData, Data>,
   cacheOptions: RequiredCacheOptions
 ): Promise<Data> => {
-  const promise = toPromise(getPromise(id) as Promise<Data | RawData>).then(
-    dataTransformer
+  const promise = toPromise(getPromise(id) as Promise<Data | RawData>).then(d =>
+    dataTransformer(d, id)
   ) as Promise<Data>;
   return saveSinglePromise(id, promise, options, inner, cacheOptions);
 };
@@ -500,7 +500,7 @@ const saveSinglePromise = async <Id, RawData, Data>(
   id: Id,
   singlePromise: Promise<Data>,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>,
   cacheOptions: RequiredCacheOptions
@@ -643,7 +643,7 @@ const getCollectorRequest = <
     ManyData
   >,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ) => {
@@ -770,7 +770,7 @@ const getCollectorRequest = <
           return {
             empty: false as const,
             isPromise: false as const,
-            data: dataTransformer(data),
+            data: dataTransformer(data, ids[index]),
             index,
             id: ids[index],
           };
@@ -915,7 +915,7 @@ const saveManySingleRequests = <
     ManyData
   >,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data) => Data;
+    dataTransformer?: (data: RawData | Data, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ) => {
@@ -1027,7 +1027,7 @@ interface CollmiseCreatorFn {
   <Id, Data>(options: CollmiseOptions<Id, Data>): Collmise<Id, Data>;
   <Id, RawData, Data>(
     options: CollmiseOptions<Id, RawData, Data> & {
-      dataTransformer: (data: RawData | Data) => Data;
+      dataTransformer: (data: RawData | Data, id: Id) => Data;
     }
   ): Collmise<Id, RawData, Data>;
 }
@@ -1075,7 +1075,7 @@ interface CollectorOptions<
   ) => RawManyData | ManyData | Promise<RawManyData | ManyData>;
   findOne: (id: Id, manyData: ManyData) => RawData | Data | undefined | null;
   alwaysCallCollector?: boolean;
-  /** default: true */
+  /** @defaultValue true */
   useCache?: boolean;
   mergeOnData?: (
     manyData: ManyData | undefined,
@@ -1199,11 +1199,11 @@ interface UnitCollmiseCreatorFn {
 }
 
 interface UnitCollmiseOptions {
-  /** default: 0 */
+  /** @defaultValue 0 */
   responseCacheTimeoutMS?: number;
   freshRequestOptions?: Pick<
     CacheOptions,
-    "joinConcurrentRequests" | "useResponseCache"
+    "joinConcurrentRequests" | "useResponseCache" | "cacheResponse"
   >;
 }
 
@@ -1215,7 +1215,10 @@ export interface UnitCollmise<Data> {
   fresh: (freshLoad: boolean | undefined | null) => UnitCollmise<Data>;
   cacheOptions: (
     options:
-      | Pick<CacheOptions, "joinConcurrentRequests" | "useResponseCache">
+      | Pick<
+          CacheOptions,
+          "joinConcurrentRequests" | "useResponseCache" | "cacheResponse"
+        >
       | undefined
       | null
   ) => UnitCollmise<Data>;
