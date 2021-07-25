@@ -31,12 +31,7 @@ export interface CollmiseOptions<Id, RawData, Data = RawData> {
   alwaysCallDirectRequest?: boolean;
   findCachedData?: (
     id: Id
-  ) =>
-    | RawData
-    | Data
-    | undefined
-    | null
-    | Promise<RawData | Data | undefined | null>;
+  ) => Data | undefined | null | Promise<Data | undefined | null>;
   getNotFoundError?: (id: Id) => any;
   freshRequestOptions?: CacheOptions;
   isNonEmptyData?: (
@@ -120,7 +115,7 @@ interface QueuedCluster<Id, RawData, Data> {
 
 const collmiseHelper = <Id, RawData, Data, Collectors extends AnyCollectors>(
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ): Collmise<Id, RawData, Data, Collectors> => {
@@ -190,7 +185,7 @@ function isNonEmptyData<T>(value: T): value is Exclude<T, null | undefined> {
 
 const getOnFn = <Id, RawData, Data, Collectors extends AnyCollectors>(
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ) => {
@@ -269,7 +264,7 @@ const getFoundPromiseOnKey = <Id, RawData, Data>(
 const getSingleRequest = <Id, RawData, Data>(
   id: Id,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>,
   skipCallingOne: boolean
@@ -288,7 +283,7 @@ const getSingleRequest = <Id, RawData, Data>(
     undefined
   > = options.dataTransformer
     ? options.dataTransformer
-    : rawData => rawData as Data;
+    : rawData => (rawData as any) as Data;
 
   const cacheOptions = getCacheOptions(options, inner);
 
@@ -304,7 +299,7 @@ const getSingleRequest = <Id, RawData, Data>(
       const cachedData = await options.findCachedData(id);
       if (isNotEmpty(cachedData)) {
         hasFoundData = true;
-        foundedDataPromsie = dataTransformer(cachedData!, id);
+        foundedDataPromsie = cachedData! as Data;
       }
     }
     if (!hasFoundData) {
@@ -439,8 +434,7 @@ const getSingleRequest = <Id, RawData, Data>(
 
   const result = getFoundPromiseOnKey(key, cacheOptions, inner);
   if (result) {
-    hasFoundData = true;
-    foundedDataPromsie = result.promise;
+    return result.promise;
   }
 
   return sendSingle(
@@ -456,20 +450,14 @@ const getSingleRequest = <Id, RawData, Data>(
 
 const transformFoundedOneData = <Id, RawData, Data = RawData>(
   id: Id,
-  oneData: RawData | Data | null | undefined,
+  oneData: Data | null | undefined,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   }
 ) => {
   const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
-  const dataTransformer: Exclude<
-    typeof options.dataTransformer,
-    undefined
-  > = options.dataTransformer
-    ? options.dataTransformer
-    : rawData => rawData as Data;
   if (isNotEmpty(oneData)) {
-    return dataTransformer(oneData!, id);
+    return oneData! as Data;
   } else {
     const getNotFoundError =
       options.getNotFoundError || defaultGetNotFoundError;
@@ -485,12 +473,12 @@ const sendSingle = async <Id, RawData, Data>(
   id: Id,
   key: string,
   options: CollmiseOptions<Id, RawData, Data>,
-  dataTransformer: (data: RawData | Data, id: Id) => Data,
-  getPromise: (id: Id) => RawData | Data | Promise<RawData | Data>,
+  dataTransformer: (data: RawData, id: Id) => Data,
+  getPromise: (id: Id) => RawData | Promise<RawData>,
   inner: InnerOptions<Id, RawData, Data>,
   cacheOptions: RequiredCacheOptions
 ): Promise<Data> => {
-  const promise = toPromise(getPromise(id) as Promise<Data | RawData>).then(d =>
+  const promise = toPromise(getPromise(id) as Promise<RawData>).then(d =>
     dataTransformer(d, id)
   ) as Promise<Data>;
   return saveSinglePromise(id, promise, options, inner, cacheOptions);
@@ -500,7 +488,7 @@ const saveSinglePromise = async <Id, RawData, Data>(
   id: Id,
   singlePromise: Promise<Data>,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>,
   cacheOptions: RequiredCacheOptions
@@ -643,14 +631,12 @@ const getCollectorRequest = <
     ManyData
   >,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ) => {
   const mainFn = (
-    getForClaster?: (
-      cluster: IdCluster
-    ) => ManyData | RawManyData | Promise<ManyData | RawManyData>
+    getForClaster?: (cluster: IdCluster) => RawManyData | Promise<RawManyData>
   ): { mainPromise: Promise<ManyData>; waiter: Promise<void> } => {
     let useCache = true;
     if (!options.findCachedData) useCache = false;
@@ -669,7 +655,7 @@ const getCollectorRequest = <
       undefined
     > = options.dataTransformer
       ? options.dataTransformer
-      : rawData => rawData as Data;
+      : rawData => (rawData as any) as Data;
 
     const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
 
@@ -715,7 +701,7 @@ const getCollectorRequest = <
         getForClaster
           ? getForClaster(idCluster)
           : collectorInfo.collector.onRequest(idCluster)
-      ) as Promise<RawManyData | ManyData | void>;
+      ) as Promise<RawManyData | void>;
       const mainPromise: Promise<ManyData> = fetchedDataPromise.then(
         async fetchedData => {
           let finalData: ManyData;
@@ -724,10 +710,10 @@ const getCollectorRequest = <
             collectorInfo.collector.multiDataTransformer
           ) {
             finalData = await collectorInfo.collector.multiDataTransformer(
-              fetchedData as RawManyData | ManyData,
+              fetchedData as RawManyData,
               idCluster
             );
-          } else finalData = fetchedData as ManyData;
+          } else finalData = (fetchedData as any) as ManyData;
           return finalData;
         }
       );
@@ -848,20 +834,22 @@ const getCollectorRequest = <
   };
 
   return (
-    getForClaster?: (
-      cluster: IdCluster
-    ) => ManyData | RawManyData | Promise<ManyData | RawManyData>
+    getForClaster?: (cluster: IdCluster) => RawManyData | Promise<RawManyData>
   ): Promise<ManyData> => {
     const { mainPromise, waiter } = mainFn(getForClaster);
-    waiter.then(() =>
-      saveManySingleRequests(
-        mainPromise,
-        idCluster,
-        collectorInfo,
-        options,
-        inner
+    waiter
+      .then(() =>
+        saveManySingleRequests(
+          mainPromise,
+          idCluster,
+          collectorInfo,
+          options,
+          inner
+        )
       )
-    );
+      .catch(() => {
+        //
+      });
     return mainPromise;
   };
 };
@@ -915,7 +903,7 @@ const saveManySingleRequests = <
     ManyData
   >,
   options: CollmiseOptions<Id, RawData, Data> & {
-    dataTransformer?: (data: RawData | Data, id: Id) => Data;
+    dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>
 ) => {
@@ -1027,7 +1015,7 @@ interface CollmiseCreatorFn {
   <Id, Data>(options: CollmiseOptions<Id, Data>): Collmise<Id, Data>;
   <Id, RawData, Data>(
     options: CollmiseOptions<Id, RawData, Data> & {
-      dataTransformer: (data: RawData | Data, id: Id) => Data;
+      dataTransformer: (data: RawData, id: Id) => Data;
     }
   ): Collmise<Id, RawData, Data>;
 }
@@ -1070,10 +1058,8 @@ interface CollectorOptions<
   ManyData = RawManyData
 > {
   name: Name;
-  onRequest: (
-    ids: IdCluster
-  ) => RawManyData | ManyData | Promise<RawManyData | ManyData>;
-  findOne: (id: Id, manyData: ManyData) => RawData | Data | undefined | null;
+  onRequest: (ids: IdCluster) => RawManyData | Promise<RawManyData>;
+  findOne: (id: Id, manyData: ManyData) => Data | undefined | null;
   alwaysCallCollector?: boolean;
   /** @defaultValue true */
   useCache?: boolean;
@@ -1081,10 +1067,7 @@ interface CollectorOptions<
     manyData: ManyData | undefined,
     cachedData: { id: Id; data: Data }[]
   ) => ManyData | Promise<ManyData>;
-  multiDataTransformer?: (
-    data: RawManyData | ManyData,
-    idCluster: IdCluster
-  ) => ManyData;
+  multiDataTransformer?: (data: RawManyData, idCluster: IdCluster) => ManyData;
 }
 
 interface InvisibleCollectorOptions<IdCluster> {
@@ -1160,9 +1143,7 @@ export interface AddInvisibleCollectorFn<
 }
 
 export interface CollmiseSingle<Id, RawData, Data> {
-  request: (
-    fn: (id: Id) => RawData | Data | Promise<RawData | Data>
-  ) => Promise<Data>;
+  request: (fn: (id: Id) => RawData | Promise<RawData>) => Promise<Data>;
   requestAs: <D extends Data>(fn: (id: Id) => D | Promise<D>) => Promise<D>;
   submitToCollectors: () => Promise<Data>;
   fresh: (
@@ -1177,10 +1158,7 @@ export interface CollmiseCollectorMain<Collector extends CollectorType> {
   request: (
     getForClaster?: (
       ids: Collector["idCluster"]
-    ) =>
-      | Collector["rawManyData"]
-      | Collector["manyData"]
-      | Promise<Collector["rawManyData"] | Collector["manyData"]>
+    ) => Collector["rawManyData"] | Promise<Collector["rawManyData"]>
   ) => Promise<Collector["manyData"]>;
   requestAs: <D extends Collector["manyData"]>(
     getForClaster?: (ids: Collector["idCluster"]) => D | Promise<D>
