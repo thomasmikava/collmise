@@ -6,8 +6,11 @@ export const collmise: CollmiseCreatorFn = (options = {}) => {
     { ...options },
     {
       collectors: [],
-      currentlyRunningPromises: {},
-      pastResultsOfPromises: {},
+      req: {
+        currentlyRunningPromises: {},
+        promisesResponses: {},
+        queue: { keySet: new Set(), singles: [] },
+      },
     }
   ) as any;
 };
@@ -18,7 +21,7 @@ export interface CollmiseOptions<Id, RawData, Data = RawData> {
   /** default: true */
   consistentDataOnSameIds?: boolean;
   /** default: 1 */
-  waitForCollectingTimeMS?: number;
+  collectingTimeoutMS?: number;
   /** default: true */
   joinConcurrentRequests?: boolean;
   /** default: 0 */
@@ -41,30 +44,78 @@ export interface CollmiseOptions<Id, RawData, Data = RawData> {
   ) => boolean;
 }
 
+type CollectorInfo<
+  Id,
+  RawData,
+  Data,
+  Name,
+  IdCluster,
+  RawManyData,
+  ManyData = RawManyData
+> =
+  | {
+      visible: true;
+      collector: CollectorOptions<
+        Id,
+        RawData,
+        Data,
+        Name,
+        IdCluster,
+        RawManyData,
+        ManyData
+      > & {
+        splitInIdClusters?: CollmiseSplitInCluster<Id, IdCluster>;
+        clusterToIds?: (cluster: IdCluster) => Id[];
+      };
+    }
+  | {
+      visible: false;
+      collector: InvisibleCollectorOptions<IdCluster> & {
+        splitInIdClusters?: CollmiseSplitInCluster<Id, IdCluster>;
+        clusterToIds?: (cluster: IdCluster) => Id[];
+        mergeOnData?: (
+          manyData: ManyData | undefined,
+          cachedData: { id: Id; data: Data }[]
+        ) => ManyData | Promise<ManyData>;
+      };
+    };
+
 interface InnerOptions<Id, RawData, Data> {
-  collectors: (
-    | {
-        visible: true;
-        collector: CollectorOptions<Id, RawData, Data, any, any, any> & {
-          splitInIdClusters?: (ids: Id[]) => any[];
-        };
-      }
-    | {
-        visible: false;
-        collector: InvisibleCollectorOptions<any> & {
-          splitInIdClusters?: (ids: Id[]) => any[];
-        };
-      }
-  )[];
+  collectors: CollectorInfo<Id, RawData, Data, any, any, any>[];
   _passedCacheOptions?: CacheOptions;
   useFresh?: boolean | null | undefined;
   multiUseCache?: boolean | null | undefined;
-  currentlyRunningPromises: {
-    [id in string | number | symbol]?: Promise<Data>;
+  multiUseFresh?: boolean | null | undefined;
+  req: {
+    currentlyRunningPromises: {
+      [id in string | number | symbol]?: Promise<Data>;
+    };
+    promisesResponses: {
+      [id in string | number | symbol]?: { p: Promise<Data> };
+    };
+    delayPromise?: Promise<{
+      queuedClusters: QueuedCluster<Id, RawData, Data>[];
+    } | void>;
+    queue: {
+      singles: {
+        id: Id;
+        key: string;
+        hasFoundData: boolean;
+        skipCallingOne?: boolean;
+      }[];
+      keySet: Set<string>;
+    };
   };
-  pastResultsOfPromises: {
-    [id in string | number | symbol]?: { p: Promise<Data> };
-  };
+  disableSpreading?: boolean;
+  disableSavingSpreadPromises?: boolean;
+}
+
+interface QueuedCluster<Id, RawData, Data> {
+  cluster: any;
+  ids: Id[];
+  keySet: Set<string>;
+  collectorPromise?: Promise<any>;
+  collector: CollectorOptions<Id, RawData, Data, any, any, any>;
 }
 
 const collmiseHelper = <Id, RawData, Data, Collectors extends AnyCollectors>(
@@ -81,19 +132,40 @@ const collmiseHelper = <Id, RawData, Data, Collectors extends AnyCollectors>(
         ...inner,
         collectors: removeDublicateCollectors([
           ...inner.collectors,
-          { visible: true, collector },
+          normalizeCollectorInfo({
+            visible: true,
+            collector: { ...collector },
+          }),
         ]),
       }) as any;
     },
     addInvisibleCollector: (collector: InvisibleCollectorOptions<any>) => {
       return collmiseHelper(options, {
         ...inner,
-        collectors: [...inner.collectors, { visible: false, collector }],
+        collectors: [
+          ...inner.collectors,
+          normalizeCollectorInfo({
+            visible: false,
+            collector: { ...collector },
+          }),
+        ],
       }) as any;
     },
     collectors: getCollectors(options, inner),
     on: getOnFn(options, inner),
   };
+};
+
+const normalizeCollectorInfo = <
+  Collector extends CollectorInfo<any, any, any, any, any, any>
+>(
+  info: Collector
+): Collector => {
+  if (!info.collector.splitInIdClusters && !info.collector.clusterToIds) {
+    info.collector.splitInIdClusters = ids => [{ cluster: ids, ids }];
+    info.collector.clusterToIds = ids => ids;
+  }
+  return info;
 };
 
 const removeDublicateCollectors = <
@@ -177,7 +249,24 @@ const serializeId = (id, options: CollmiseOptions<any, any>): string => {
   return JSON.stringify(id);
 };
 
-const getSingleRequest = <Id, RawData, Data, Collectors extends AnyCollectors>(
+const getFoundPromiseOnKey = <Id, RawData, Data>(
+  key: string,
+  cacheOptions: RequiredCacheOptions,
+  inner: InnerOptions<Id, RawData, Data>
+) => {
+  if (
+    cacheOptions.joinConcurrentRequests &&
+    inner.req.currentlyRunningPromises[key]
+  ) {
+    return { promise: inner.req.currentlyRunningPromises[key]! };
+  }
+  if (cacheOptions.useResponseCache && inner.req.promisesResponses[key]) {
+    return { promise: inner.req.promisesResponses[key]!.p };
+  }
+  return null;
+};
+
+const getSingleRequest = <Id, RawData, Data>(
   id: Id,
   options: CollmiseOptions<Id, RawData, Data> & {
     dataTransformer?: (data: RawData | Data) => Data;
@@ -205,41 +294,228 @@ const getSingleRequest = <Id, RawData, Data, Collectors extends AnyCollectors>(
 
   const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
 
+  let hasFoundData = false;
+  let foundedDataPromsie: Data | Promise<Data> | undefined = undefined;
+
+  const isCallingMultipleRequired = false;
+
   if (!skipCallingOne) {
     if (cacheOptions.useCache && typeof options.findCachedData === "function") {
       const cachedData = await options.findCachedData(id);
       if (isNotEmpty(cachedData)) {
-        return dataTransformer(cachedData!); // TODO: what if calling many is required?
+        hasFoundData = true;
+        foundedDataPromsie = dataTransformer(cachedData!);
       }
     }
-    if (
-      cacheOptions.joinConcurrentRequests &&
-      inner.currentlyRunningPromises[key]
-    ) {
-      return inner.currentlyRunningPromises[key]!; // TODO: what if calling many is required?
-    }
-    if (cacheOptions.useResponseCache && inner.pastResultsOfPromises[key]) {
-      return inner.pastResultsOfPromises[key]!.p; // TODO: what if calling many is required?
+    if (!hasFoundData) {
+      const result = getFoundPromiseOnKey(key, cacheOptions, inner);
+      if (result) {
+        hasFoundData = true;
+        foundedDataPromsie = result.promise;
+      }
     }
   }
-  if (!skipCallingOne) {
-    let promise: Promise<Data> | undefined = undefined;
-    try {
-      promise = toPromise(getPromise(id) as Promise<Data | RawData>).then(
-        dataTransformer
-      ) as Promise<Data>;
-      if (cacheOptions.cacheResponse) {
-        inner.currentlyRunningPromises[key] = promise;
-      }
-      const data = await promise;
 
-      saveResponse(key, promise, cacheOptions, options, inner);
-      return data;
-    } catch (e) {
-      if (inner.currentlyRunningPromises[key] === promise) {
-        delete inner.currentlyRunningPromises[key];
+  if (!isCallingMultipleRequired && hasFoundData) {
+    return foundedDataPromsie as Data;
+  }
+
+  const collectingTimeoutMS =
+    typeof options.collectingTimeoutMS === "undefined"
+      ? 1
+      : options.collectingTimeoutMS;
+  const hasCollectors = inner.collectors.length > 0;
+  if (
+    !inner.req.queue.keySet.has(key) ||
+    options.consistentDataOnSameIds === false
+  ) {
+    inner.req.queue.keySet.add(key);
+    inner.req.queue.singles.push({
+      id,
+      hasFoundData,
+      key,
+      skipCallingOne,
+    });
+  }
+
+  if (collectingTimeoutMS > 0 && hasCollectors && !inner.req.delayPromise) {
+    inner.req.delayPromise = new Promise(resolve => {
+      setTimeout(() => {
+        delete inner.req.delayPromise;
+        const skipCallingsKeys = new Set(
+          inner.req.queue.singles.filter(e => e.skipCallingOne).map(e => e.key)
+        );
+        const uncached = inner.req.queue.singles.filter(e => !e.hasFoundData);
+        const uncachedIds = uncached.map(e => e.id);
+        const allIds = inner.req.queue.singles.map(e => e.id);
+        const queuedClusters: QueuedCluster<Id, RawData, Data>[] = [];
+        for (const collectorInfo of inner.collectors) {
+          const clusteredIds: ReturnType<Exclude<
+            typeof collectorInfo["collector"]["splitInIdClusters"],
+            undefined
+          >> = collectorInfo.collector.splitInIdClusters
+            ? collectorInfo.collector.splitInIdClusters(uncachedIds)
+            : [{ cluster: uncachedIds, ids: uncachedIds }];
+          for (const clusterInfo of clusteredIds) {
+            if (clusterInfo.ids.length === 0) continue;
+            const collectorRequest = getCollectorRequest(
+              clusterInfo.cluster,
+              collectorInfo,
+              options,
+              {
+                ...inner,
+                multiUseCache: false,
+                disableSpreading: true,
+                disableSavingSpreadPromises: true,
+              }
+            );
+            const sendMultiRequest = !!(
+              clusterInfo.ids.length > 1 ||
+              (clusterInfo.ids.length === 1 &&
+                skipCallingsKeys.has(
+                  serializeId(clusterInfo.ids[0], options)
+                )) ||
+              collectorInfo.collector.alwaysCallCollector
+            );
+            const collectorPromise = sendMultiRequest
+              ? collectorRequest()
+              : undefined;
+            if (collectorInfo.visible) {
+              const queued: QueuedCluster<Id, RawData, Data> = {
+                cluster: clusterInfo,
+                collector: collectorInfo.collector,
+                collectorPromise,
+                ids: clusterInfo.ids,
+                keySet: new Set(uncached.map(e => e.key)),
+              };
+              if (!sendMultiRequest) delete queued.collectorPromise;
+              queuedClusters.push(queued);
+            }
+          }
+        }
+        inner.req.queue = {
+          keySet: new Set(),
+          singles: [],
+        };
+        resolve({
+          queuedClusters,
+        });
+      }, collectingTimeoutMS);
+    });
+  }
+
+  if (!options.alwaysCallDirectRequest) {
+    const result = await inner.req.delayPromise;
+
+    let foundQueued: QueuedCluster<Id, RawData, Data> | undefined = undefined;
+    if (result) {
+      foundQueued = result.queuedClusters.find(e => e.keySet.has(key));
+    }
+
+    if (
+      hasFoundData &&
+      (!foundQueued || !foundQueued.collector.alwaysCallCollector)
+    ) {
+      return foundedDataPromsie as Data;
+    }
+
+    if (foundQueued && foundQueued.hasOwnProperty("collectorPromise")) {
+      const mainData = await foundQueued.collectorPromise;
+      if (hasFoundData) {
+        return foundedDataPromsie as Data;
       }
-      throw e;
+      const oneData = foundQueued.collector.findOne(id, mainData);
+      return transformFoundedOneData(id, oneData, options);
+    }
+  }
+
+  if (hasFoundData) {
+    return foundedDataPromsie as Data;
+  }
+
+  if (skipCallingOne) {
+    throw new Error(`no gathering collector found`);
+  }
+
+  const result = getFoundPromiseOnKey(key, cacheOptions, inner);
+  if (result) {
+    hasFoundData = true;
+    foundedDataPromsie = result.promise;
+  }
+
+  return sendSingle(
+    id,
+    key,
+    options,
+    dataTransformer,
+    getPromise,
+    inner,
+    cacheOptions
+  );
+};
+
+const transformFoundedOneData = <Id, RawData, Data = RawData>(
+  id: Id,
+  oneData: RawData | Data | null | undefined,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData | Data) => Data;
+  }
+) => {
+  const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
+  const dataTransformer: Exclude<
+    typeof options.dataTransformer,
+    undefined
+  > = options.dataTransformer
+    ? options.dataTransformer
+    : rawData => rawData as Data;
+  if (isNotEmpty(oneData)) {
+    return dataTransformer(oneData!);
+  } else {
+    const getNotFoundError =
+      options.getNotFoundError || defaultGetNotFoundError;
+    throw getNotFoundError(id);
+  }
+};
+
+const defaultGetNotFoundError = (id: any) => {
+  return new Error(`id ${id} not found`);
+};
+
+const sendSingle = async <Id, RawData, Data>(
+  id: Id,
+  key: string,
+  options: CollmiseOptions<Id, RawData, Data>,
+  dataTransformer: (data: RawData | Data) => Data,
+  getPromise: (id: Id) => RawData | Data | Promise<RawData | Data>,
+  inner: InnerOptions<Id, RawData, Data>,
+  cacheOptions: RequiredCacheOptions
+): Promise<Data> => {
+  const promise = toPromise(getPromise(id) as Promise<Data | RawData>).then(
+    dataTransformer
+  ) as Promise<Data>;
+  return saveSinglePromise(id, promise, options, inner, cacheOptions);
+};
+
+const saveSinglePromise = async <Id, RawData, Data>(
+  id: Id,
+  singlePromise: Promise<Data>,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData | Data) => Data;
+  },
+  inner: InnerOptions<Id, RawData, Data>,
+  cacheOptions: RequiredCacheOptions
+): Promise<Data> => {
+  const key = serializeId(id, options);
+  try {
+    if (cacheOptions.cacheResponse) {
+      inner.req.currentlyRunningPromises[key] = singlePromise;
+    }
+    const data = await singlePromise;
+    saveResponse(key, singlePromise, cacheOptions, options, inner);
+    return data;
+  } finally {
+    if (inner.req.currentlyRunningPromises[key] === singlePromise) {
+      delete inner.req.currentlyRunningPromises[key];
     }
   }
 };
@@ -253,15 +529,15 @@ const saveResponse = (
 ) => {
   const responseCacheTimeoutMS = options.responseCacheTimeoutMS || 0;
   if (cacheOptions.cacheResponse && responseCacheTimeoutMS > 0) {
-    inner.pastResultsOfPromises[key] = {
+    inner.req.promisesResponses[key] = {
       p: promise,
     };
     setTimeout(() => {
       if (
-        inner.pastResultsOfPromises[key] &&
-        inner.pastResultsOfPromises[key]!.p === promise
+        inner.req.promisesResponses[key] &&
+        inner.req.promisesResponses[key]!.p === promise
       ) {
-        delete inner.pastResultsOfPromises[key];
+        delete inner.req.promisesResponses[key];
       }
     }, responseCacheTimeoutMS);
   }
@@ -313,7 +589,7 @@ const getCollectorFn = <
       return getCollectorFn<Id, RawData, Data, Collectors, Name>(
         name,
         options,
-        { ...inner, useFresh: value }
+        { ...inner, multiUseFresh: value }
       )(idCluster);
     };
     const useCache: V["useCache"] = (...args) => {
@@ -324,17 +600,19 @@ const getCollectorFn = <
         options,
         {
           ...inner,
-          _passedCacheOptions: {
-            ...inner._passedCacheOptions,
-            useCache: value,
-          },
+          multiUseCache: value,
         }
       )(idCluster);
     };
-    const request: V["request"] = () => {
-      return null as any;
-      // TODO: implement
-    };
+    const collectorInfo = inner.collectors.find(
+      e => e.visible === true && e.collector.name === name
+    )!;
+    const request = getCollectorRequest(
+      idCluster,
+      collectorInfo,
+      options,
+      inner
+    ) as any;
     return {
       useCache,
       fresh,
@@ -343,6 +621,323 @@ const getCollectorFn = <
     };
   };
   return getFn;
+};
+
+const getCollectorRequest = <
+  Id,
+  RawData,
+  Data,
+  Name,
+  IdCluster,
+  RawManyData,
+  ManyData = RawManyData
+>(
+  idCluster: IdCluster,
+  collectorInfo: CollectorInfo<
+    Id,
+    RawData,
+    Data,
+    Name,
+    IdCluster,
+    RawManyData,
+    ManyData
+  >,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData | Data) => Data;
+  },
+  inner: InnerOptions<Id, RawData, Data>
+) => {
+  const mainFn = (
+    getForClaster?: (
+      cluster: IdCluster
+    ) => ManyData | RawManyData | Promise<ManyData | RawManyData>
+  ): { mainPromise: Promise<ManyData>; waiter: Promise<void> } => {
+    let useCache = true;
+    if (!options.findCachedData) useCache = false;
+    if (options.useCache === false) useCache = false;
+    if (inner.multiUseCache === false) useCache = false;
+    if (inner.multiUseFresh === true) useCache = false;
+    /* if (
+      inner.useFresh &&
+      inner._passedCacheOptions &&
+      inner._passedCacheOptions.useCache === false
+    ) {
+      useCache = false;
+    } */
+    const dataTransformer: Exclude<
+      typeof options.dataTransformer,
+      undefined
+    > = options.dataTransformer
+      ? options.dataTransformer
+      : rawData => rawData as Data;
+
+    const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
+
+    const mainLogic = (): {
+      mainPromise: Promise<ManyData>;
+      waiter: Promise<void>;
+    } => {
+      const spread = !inner.disableSpreading;
+
+      if (
+        spread &&
+        collectorInfo.collector.splitInIdClusters &&
+        collectorInfo.collector.clusterToIds &&
+        collectorInfo.collector.mergeOnData
+      ) {
+        const copiedInner = { ...inner };
+        if (typeof inner.multiUseCache === "boolean") {
+          inner._passedCacheOptions = {
+            ...inner._passedCacheOptions,
+            useCache: inner.multiUseCache,
+          };
+        }
+        const ids = collectorInfo.collector.clusterToIds(idCluster);
+        const allPromises = ids.map(id =>
+          getSingleRequest(
+            id,
+            options,
+            copiedInner,
+            true
+          )(() => Promise.reject("fake function"))
+        );
+        const getAll = Promise.all(allPromises);
+        const mainPromise: Promise<ManyData> = getAll.then(allData =>
+          collectorInfo.collector.mergeOnData!(
+            undefined,
+            allData.map((data, index) => ({ data, id: ids[index] }))
+          )
+        );
+        return { mainPromise, waiter: getAll.then() };
+      }
+
+      const fetchedDataPromise = toPromise(
+        getForClaster
+          ? getForClaster(idCluster)
+          : collectorInfo.collector.onRequest(idCluster)
+      ) as Promise<RawManyData | ManyData | void>;
+      const mainPromise: Promise<ManyData> = fetchedDataPromise.then(
+        async fetchedData => {
+          let finalData: ManyData;
+          if (
+            collectorInfo.visible &&
+            collectorInfo.collector.multiDataTransformer
+          ) {
+            finalData = await collectorInfo.collector.multiDataTransformer(
+              fetchedData as RawManyData | ManyData,
+              idCluster
+            );
+          } else finalData = fetchedData as ManyData;
+          return finalData;
+        }
+      );
+      return { mainPromise, waiter: Promise.resolve() };
+    };
+
+    if (
+      useCache &&
+      collectorInfo.collector.splitInIdClusters &&
+      collectorInfo.collector.clusterToIds &&
+      collectorInfo.collector.mergeOnData &&
+      options.findCachedData
+    ) {
+      const ids = collectorInfo.collector.clusterToIds(idCluster);
+
+      const cachedPromises = ids.map(id =>
+        toPromise(options.findCachedData!(id))
+      );
+      const mainPromise = stickyPromise<ManyData>();
+      const waiterPromise = stickyPromise<any>();
+      const topPromise = Promise.all(cachedPromises).then(cachedData => {
+        const cacheOptions = getCacheOptions(options, inner);
+
+        const results = cachedData.map((data, index) => {
+          const empty = !isNotEmpty(data);
+          if (empty) {
+            const key = serializeId(ids[index], options);
+            const singleResult = getFoundPromiseOnKey(key, cacheOptions, inner);
+            if (!singleResult) {
+              return { empty: true as const, index, id: ids[index] };
+            }
+            return {
+              empty: false as const,
+              isPromise: true as const,
+              data: singleResult.promise,
+              index,
+              id: ids[index],
+            };
+          }
+          return {
+            empty: false as const,
+            isPromise: false as const,
+            data: dataTransformer(data),
+            index,
+            id: ids[index],
+          };
+        });
+        const hasFoundAtLeasOne = results.some(e => !e.empty);
+        if (hasFoundAtLeasOne) {
+          const notFoundIds = results.filter(e => e.empty).map(e => e.id);
+          let manyData: ManyData | undefined = undefined;
+
+          const successfullyCachedData = results
+            .filter(e => !e.empty)
+            .map(
+              e =>
+                new Promise<{ id: Id; data: Data }>((resolve, reject) => {
+                  (toPromise(e.data) as Promise<Data>)
+                    .then(data => resolve({ id: e.id, data }))
+                    .catch(reject);
+                })
+            );
+          const successfullyCachedDataPromise = Promise.all(
+            successfullyCachedData
+          );
+
+          waiterPromise.attach(successfullyCachedDataPromise);
+
+          successfullyCachedDataPromise.then().catch();
+
+          const fn = async () => {
+            if (notFoundIds.length > 0) {
+              const clustersInfo = collectorInfo.collector.splitInIdClusters!(
+                notFoundIds
+              );
+
+              if (clustersInfo.length !== 1) {
+                throw new Error(
+                  "excpected tu return exactly one cluster for ids " +
+                    notFoundIds
+                );
+              }
+
+              const newCluster = clustersInfo[0].cluster;
+
+              manyData = await getCollectorRequest(
+                newCluster,
+                collectorInfo,
+                options,
+                {
+                  ...inner,
+                  multiUseCache: false,
+                  disableSavingSpreadPromises: true,
+                }
+              )(getForClaster);
+            }
+            return collectorInfo.collector.mergeOnData!(
+              manyData,
+              await successfullyCachedDataPromise
+            );
+          };
+          const finalResult = fn();
+          waiterPromise.attach(finalResult);
+          mainPromise.attach(finalResult);
+        } else {
+          const res = mainLogic();
+          mainPromise.attach(res.mainPromise);
+          waiterPromise.attach(res.waiter);
+        }
+      });
+      mainPromise.attachCatch(topPromise);
+      waiterPromise.attachCatch(topPromise);
+
+      return { mainPromise, waiter: waiterPromise };
+    }
+
+    return mainLogic();
+  };
+
+  return (
+    getForClaster?: (
+      cluster: IdCluster
+    ) => ManyData | RawManyData | Promise<ManyData | RawManyData>
+  ): Promise<ManyData> => {
+    const { mainPromise, waiter } = mainFn(getForClaster);
+    waiter.then(() =>
+      saveManySingleRequests(
+        mainPromise,
+        idCluster,
+        collectorInfo,
+        options,
+        inner
+      )
+    );
+    return mainPromise;
+  };
+};
+
+const stickyPromise = <Data>() => {
+  let final: { data: any; resolved: boolean } | null = null;
+  const helper = {
+    resolve: (data: Data) => {
+      if (!final) final = { data, resolved: true };
+    },
+    reject: (error: any) => {
+      if (!final) final = { data: error, resolved: false };
+    },
+  };
+  const promise = new Promise<Data>((resolve, reject) => {
+    if (final) {
+      if (final.resolved) resolve(final.data);
+      else reject(final.data);
+    }
+    helper.resolve = resolve;
+    helper.reject = reject;
+  });
+  return Object.assign(promise, helper, {
+    attach: (prom: Promise<Data>) => {
+      prom.then(helper.resolve).catch(helper.reject);
+    },
+    attachCatch: (prom: Promise<any>) => {
+      prom.catch(helper.reject);
+    },
+  });
+};
+
+const saveManySingleRequests = <
+  Id,
+  RawData,
+  Data,
+  Name,
+  IdCluster,
+  RawManyData,
+  ManyData = RawManyData
+>(
+  promise: Promise<ManyData>,
+  idCluster: IdCluster,
+  collectorInfo: CollectorInfo<
+    Id,
+    RawData,
+    Data,
+    Name,
+    IdCluster,
+    RawManyData,
+    ManyData
+  >,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData | Data) => Data;
+  },
+  inner: InnerOptions<Id, RawData, Data>
+) => {
+  if (
+    !inner.disableSavingSpreadPromises &&
+    collectorInfo.visible === true &&
+    collectorInfo.collector.clusterToIds &&
+    collectorInfo.collector.findOne
+  ) {
+    const ids = collectorInfo.collector.clusterToIds(idCluster);
+    const cacheOptions = getCacheOptions(options, inner);
+    for (const id of ids) {
+      const singlePromise = promise.then(manyData => {
+        return transformFoundedOneData(
+          id,
+          collectorInfo.collector.findOne!(id, manyData),
+          options
+        );
+      });
+      saveSinglePromise(id, singlePromise, options, inner, cacheOptions);
+    }
+  }
 };
 
 const getCacheOptions = (
@@ -359,7 +954,7 @@ const getCacheOptions = (
     };
   }
   if (!getPureCacheOptions && inner.useFresh) {
-    return getFreshOptions(options, inner);
+    return getFreshOptions(options);
   }
   return {
     useCache:
@@ -378,8 +973,7 @@ const getCacheOptions = (
   };
 };
 const getFreshOptions = (
-  options: CollmiseOptions<any, any>,
-  inner: InnerOptions<any, any, any>
+  options: CollmiseOptions<any, any>
 ): RequiredCacheOptions => {
   return {
     joinConcurrentRequests:
@@ -481,25 +1075,15 @@ interface CollectorOptions<
   ) => RawManyData | ManyData | Promise<RawManyData | ManyData>;
   findOne: (id: Id, manyData: ManyData) => RawData | Data | undefined | null;
   alwaysCallCollector?: boolean;
+  /** default: true */
+  useCache?: boolean;
   mergeOnData?: (
-    manyData: ManyData,
-    cachedData: { id: Id; data: Data }[],
-    originalArguments: IdCluster
+    manyData: ManyData | undefined,
+    cachedData: { id: Id; data: Data }[]
   ) => ManyData | Promise<ManyData>;
-  findCachedData?: (
-    idCluster: IdCluster
-  ) =>
-    | RawManyData
-    | ManyData
-    | undefined
-    | null
-    | Promise<RawManyData | ManyData | undefined | null>;
   multiDataTransformer?: (
     data: RawManyData | ManyData,
-    extra: {
-      idCluster: IdCluster;
-      originallyRequestedIds: Id[];
-    }
+    idCluster: IdCluster
   ) => ManyData;
 }
 
@@ -540,7 +1124,8 @@ export interface AddCollectorFn<
       RawManyData,
       ManyData
     > & {
-      splitInIdClusters: (ids: Id[]) => IdCluster[];
+      splitInIdClusters: CollmiseSplitInCluster<Id, IdCluster>;
+      clusterToIds?: (cluster: IdCluster) => Id[];
     }
   ): Collmise<
     Id,
@@ -550,6 +1135,10 @@ export interface AddCollectorFn<
       { [name in Name]: CollectorType<RawManyData, ManyData, IdCluster> }
   >;
 }
+
+export type CollmiseSplitInCluster<Id, IdCluster> = (
+  ids: Id[]
+) => { cluster: IdCluster; ids: Id[] }[];
 
 export interface AddInvisibleCollectorFn<
   Id,
@@ -565,7 +1154,7 @@ export interface AddInvisibleCollectorFn<
   >;
   <IdCluster>(
     options: InvisibleCollectorOptions<Id[]> & {
-      splitInIdClusters: (ids: Id[]) => IdCluster[];
+      splitInIdClusters: CollmiseSplitInCluster<Id, IdCluster>;
     }
   ): Collmise<Id, RawData, Data, Collectors>;
 }
