@@ -216,7 +216,7 @@ function isNonEmptyData<T>(value: T): value is Exclude<T, null | undefined> {
   return true;
 }
 
-const getOnFn = <Id, RawData, Data, Collectors extends AnyCollectors>(
+const getOnFn = <Id, RawData, Data>(
   options: CollmiseOptions<Id, RawData, Data> & {
     dataTransformer?: (data: RawData, id: Id) => Data;
   },
@@ -367,100 +367,40 @@ const getSingleRequest = <Id, RawData, Data>(
   }
 
   if (collectingTimeoutMS > 0 && hasCollectors && !inner.req.delayPromise) {
-    inner.req.delayPromise = new Promise(resolve => {
-      setTimeout(() => {
-        delete inner.req.delayPromise;
-        const skipCallingsKeys = new Set(
-          inner.req.queue.singles.filter(e => e.skipCallingOne).map(e => e.key)
-        );
-        const uncached = inner.req.queue.singles.filter(e => !e.hasFoundData);
-        const queuedClusters: QueuedCluster<Id, RawData, Data>[] = [];
-
-        for (const collectorInfo of inner.collectors) {
-          const useAll = collectorInfo.collector.useCache === false;
-          const singles = useAll ? inner.req.queue.singles : uncached;
-          const singleIds = singles.map(e => e.id);
-          const clusteredIds: ReturnType<Exclude<
-            typeof collectorInfo["collector"]["splitInIdClusters"],
-            undefined
-          >> = collectorInfo.collector.splitInIdClusters
-            ? collectorInfo.collector.splitInIdClusters(singleIds)
-            : [{ cluster: singleIds, ids: singleIds }];
-          for (const clusterInfo of clusteredIds) {
-            if (clusterInfo.ids.length === 0) continue;
-            const collectorRequest = getCollectorRequest(
-              clusterInfo.cluster,
-              collectorInfo,
-              options,
-              {
-                ...inner,
-                multiUseCache: false,
-                disableSpreading: true,
-                disableSavingSpreadPromises: true,
-              }
-            );
-            const sendMultiRequest = !!(
-              clusterInfo.ids.length > 1 ||
-              (clusterInfo.ids.length === 1 &&
-                skipCallingsKeys.has(
-                  serializeId(clusterInfo.ids[0], options)
-                )) ||
-              collectorInfo.collector.alwaysCallCollector
-            );
-            const collectorPromise = sendMultiRequest
-              ? collectorRequest()
-              : undefined;
-            if (collectorInfo.visible) {
-              const queued: QueuedCluster<Id, RawData, Data> = {
-                cluster: clusterInfo,
-                collector: collectorInfo.collector,
-                collectorPromise,
-                ids: clusterInfo.ids,
-                keySet: new Set(singles.map(e => e.key)),
-              };
-              if (!sendMultiRequest) delete queued.collectorPromise;
-              queuedClusters.push(queued);
-            }
-          }
-        }
-        inner.req.queue = {
-          keySet: new Set(),
-          singles: [],
-        };
-        resolve({
-          queuedClusters,
-        });
-      }, collectingTimeoutMS);
-    });
+    inner.req.delayPromise = getDelayPromise(
+      collectingTimeoutMS,
+      options,
+      inner
+    );
   }
 
-  if (!options.alwaysCallDirectRequest) {
-    const result = await inner.req.delayPromise;
+  const result = await inner.req.delayPromise;
 
-    let matchedQueues: QueuedCluster<Id, RawData, Data>[] = [];
-    if (result) {
-      matchedQueues = result.queuedClusters.filter(e => e.keySet.has(key));
-    }
+  let matchedQueues: QueuedCluster<Id, RawData, Data>[] = [];
+  if (result) {
+    matchedQueues = result.queuedClusters.filter(e => e.keySet.has(key));
+  }
 
-    if (
-      hasFoundData &&
-      (matchedQueues.length === 0 ||
-        matchedQueues.every(e => !e.collector.alwaysCallCollector))
-    ) {
+  if (
+    hasFoundData &&
+    (matchedQueues.length === 0 ||
+      matchedQueues.every(e => !e.collector.alwaysCallCollector))
+  ) {
+    return foundedDataPromsie as Data;
+  }
+
+  if (
+    matchedQueues.length > 0 &&
+    matchedQueues.some(e => e.hasOwnProperty("collectorPromise"))
+  ) {
+    const collectorPromises = matchedQueues
+      .filter(e => e.hasOwnProperty("collectorPromise"))
+      .map(e => e.collectorPromise!.then(manyData => ({ ...e, manyData })));
+    const promiseResults = await Promise.all(collectorPromises);
+    if (hasFoundData) {
       return foundedDataPromsie as Data;
     }
-
-    if (
-      matchedQueues.length > 0 &&
-      matchedQueues.some(e => e.hasOwnProperty("collectorPromise"))
-    ) {
-      const collectorPromises = matchedQueues
-        .filter(e => e.hasOwnProperty("collectorPromise"))
-        .map(e => e.collectorPromise!.then(manyData => ({ ...e, manyData })));
-      const promiseResults = await Promise.all(collectorPromises);
-      if (hasFoundData) {
-        return foundedDataPromsie as Data;
-      }
+    if (!options.alwaysCallDirectRequest) {
       const firstCollected = promiseResults.find(e => !!e.collector.findOne);
       if (firstCollected) {
         const oneData = firstCollected.collector.findOne(
@@ -480,9 +420,9 @@ const getSingleRequest = <Id, RawData, Data>(
     throw new Error(`no gathering collector found`);
   }
 
-  const result = getFoundPromiseOnKey(key, cacheOptions, inner);
-  if (result) {
-    return result.promise;
+  const promResult = getFoundPromiseOnKey(key, cacheOptions, inner);
+  if (promResult) {
+    return promResult.promise;
   }
 
   return sendSingle(
@@ -493,6 +433,79 @@ const getSingleRequest = <Id, RawData, Data>(
     inner,
     cacheOptions
   );
+};
+
+const getDelayPromise = <Id, RawData, Data>(
+  collectingTimeoutMS: number,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData, id: Id) => Data;
+  },
+  inner: InnerOptions<Id, RawData, Data>
+): Exclude<
+  InnerOptions<Id, RawData, Data>["req"]["delayPromise"],
+  undefined
+> => {
+  return new Promise(resolve => {
+    setTimeout(() => {
+      delete inner.req.delayPromise;
+      const skipCallingsKeys = new Set(
+        inner.req.queue.singles.filter(e => e.skipCallingOne).map(e => e.key)
+      );
+      const uncached = inner.req.queue.singles.filter(e => !e.hasFoundData);
+      const queuedClusters: QueuedCluster<Id, RawData, Data>[] = [];
+
+      for (const collectorInfo of inner.collectors) {
+        const useAll = collectorInfo.collector.alwaysCallCollector === true;
+        const singles = useAll ? inner.req.queue.singles : uncached;
+        const singleIds = singles.map(e => e.id);
+        const clusteredIds: ReturnType<Exclude<
+          typeof collectorInfo["collector"]["splitInIdClusters"],
+          undefined
+        >> = collectorInfo.collector.splitInIdClusters
+          ? collectorInfo.collector.splitInIdClusters(singleIds)
+          : [{ cluster: singleIds, ids: singleIds }];
+        for (const clusterInfo of clusteredIds) {
+          if (clusterInfo.ids.length === 0) continue;
+          const collectorRequest = getCollectorRequest(
+            clusterInfo.cluster,
+            collectorInfo,
+            options,
+            {
+              ...inner,
+              multiUseCache: false,
+              disableSpreading: true,
+              disableSavingSpreadPromises: true,
+            }
+          );
+          const sendMultiRequest = !!(
+            clusterInfo.ids.length > 1 ||
+            (clusterInfo.ids.length === 1 &&
+              skipCallingsKeys.has(serializeId(clusterInfo.ids[0], options))) ||
+            collectorInfo.collector.alwaysCallCollector
+          );
+          const collectorPromise = sendMultiRequest
+            ? collectorRequest()
+            : undefined;
+          if (collectorInfo.visible) {
+            const queued: QueuedCluster<Id, RawData, Data> = {
+              cluster: clusterInfo,
+              collector: collectorInfo.collector,
+              collectorPromise,
+              ids: clusterInfo.ids,
+              keySet: new Set(singles.map(e => e.key)),
+            };
+            if (!sendMultiRequest) delete queued.collectorPromise;
+            queuedClusters.push(queued);
+          }
+        }
+      }
+      inner.req.queue = {
+        keySet: new Set(),
+        singles: [],
+      };
+      resolve({ queuedClusters });
+    }, collectingTimeoutMS);
+  });
 };
 
 const transformFoundedOneData = <Id, RawData, Data = RawData>(
