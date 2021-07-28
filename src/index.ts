@@ -722,7 +722,7 @@ const getCollectorRequest = <
       mainPromise: Promise<ManyData>;
       waiter: Promise<void>;
     } => {
-      const spread = !inner.disableSpreading;
+      const spread = !inner.disableSpreading && !getForClaster;
 
       if (
         spread &&
