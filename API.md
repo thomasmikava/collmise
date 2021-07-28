@@ -30,7 +30,7 @@ const booksCollmise = collmise({
   onRequest: (bookIds) => fetch(`/api/v1.0/books?ids=${bookIds.join()}`).then(response => response.json()),
   mergeOnData: (uncachedBooks, cachedBooksInfo) => { // uncachedBooks is undefined or response received from request
     const books = uncachedBooks || [];
-    return [...books, cachedBooksInfo.map(e => e.data)]; // cachedBooksInfo is an array of { id, data } objects
+    return [...books, ...cachedBooksInfo.map(e => e.data)]; // cachedBooksInfo is an array of { id, data } objects
   }
 }); 
 ```
@@ -58,35 +58,77 @@ Let's say that every book belongs to some library and we can only request book i
 
 ```js
 const booksCollmise = collmise().addCollector({
-  name: "many",
-  findOne: (bookId, books) => books.find(book => book.id === bookId),
-  onRequest: (bookIds) => fetch(`/api/v1.0/books?ids=${bookIds.join()}`).then(response => response.json()),
-  splitInIdClusters: (identifications /* let's receive array of { libraryId, bookId } */) => {
-    // implement custom logic. Let's return the data directly just for showing
-    // return an array of { cluster: any, ids: array }
-    return [
-      {
-        cluster: {
-          libraryId: 1,
-          bookIds: [2, 5, 6]
-        },
-        ids: [2, 5, 6]
-      },
-      {
-        cluster: {
-          libraryId: 2,
-          bookIds: [8, 10, 12]
-        },
-        ids: [8, 10, 12]
-      }
-    ];
-  },
-  clusterToIds: cluster => cluster.bookIds // since our cluster has a shape of { libraryId, bookIds }
+	name: "many",
+	findOne: (requestedBook, books) =>
+		books.find(
+			book =>
+				book.id === requestedBook.bookId &&
+				book.libraryId === requestedBook.libraryId
+		),
+	onRequest: query =>
+		fetch(
+			`/api/v1.0/books?libraryId=${
+				query.libraryId
+			}&bookIds=${query.bookIds.join()}`
+		).then((response) => response.json()),
+	splitInIdClusters: (
+		identifications /* let's receive array of { libraryId, bookId } */
+	) => {
+		// implement custom logic. Let's return the data directly just for showing
+		// return an array of { cluster: any, ids: array }
+		return [
+			{
+				cluster: {
+					libraryId: 1,
+					bookIds: [2, 5, 6],
+				},
+				ids: [
+					{
+						libraryId: 1,
+						bookId: 2,
+					},
+					{
+						libraryId: 1,
+						bookId: 5,
+					},
+					{
+						libraryId: 1,
+						bookId: 6,
+					},
+				],
+			},
+			{
+				cluster: {
+					libraryId: 2,
+					bookIds: [8, 10, 12],
+				},
+				ids: [
+					{
+						libraryId: 2,
+						bookId: 8,
+					},
+					{
+						libraryId: 2,
+						bookId: 10,
+					},
+					{
+						libraryId: 2,
+						bookId: 12,
+					},
+				],
+			},
+		];
+	},
+	clusterToIds: cluster =>
+		cluster.bookIds.map(bookId => ({
+			bookId,
+			libraryId: cluster.libraryId,
+		})), // since our cluster has a shape of { libraryId, bookIds }
 });
 ```
 
 ```js
-booksCollmise.collectors.manyByIds({
+booksCollmise.collectors.many({
   libraryId: 1,
   bookIds: [2, 5]
 }).request();
@@ -96,12 +138,12 @@ booksCollmise.on({
   bookId: 8
 }).request(() => fetch(`/api/v1.0/books?libraryId=2&bookId=8`).then(response => response.json()));
 
-booksCollmise.collectors.manyByIds({
+booksCollmise.collectors.many({
   libraryId: 1,
   bookIds: [5, 6]
 }).request();
 
-booksCollmise.collectors.manyByIds({
+booksCollmise.collectors.many({
   libraryId: 2,
   bookIds: [10, 12]
 }).request();
