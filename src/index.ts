@@ -488,11 +488,13 @@ const getDelayPromise = <Id, RawData, Data>(
             : undefined;
           if (collectorInfo.visible) {
             const queued: QueuedCluster<Id, RawData, Data> = {
-              cluster: clusterInfo,
+              cluster: clusterInfo.cluster,
               collector: collectorInfo.collector,
               collectorPromise,
               ids: clusterInfo.ids,
-              keySet: new Set(singles.map(e => e.key)),
+              keySet: new Set(
+                clusterInfo.ids.map(id => serializeId(id, options))
+              ),
             };
             if (!sendMultiRequest) delete queued.collectorPromise;
             queuedClusters.push(queued);
