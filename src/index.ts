@@ -108,6 +108,12 @@ type CollectorInfo<
       };
     };
 
+interface QueueItem<Id> {
+  id: Id;
+  key: string;
+  hasFoundData: boolean;
+  skipCallingOne?: boolean;
+}
 interface InnerOptions<Id, RawData, Data> {
   collectors: CollectorInfo<Id, RawData, Data, any, any, any>[];
   _passedCacheOptions?: CacheOptions;
@@ -116,21 +122,16 @@ interface InnerOptions<Id, RawData, Data> {
   multiUseFresh?: boolean | null | undefined;
   req: {
     currentlyRunningPromises: {
-      [id in string | number | symbol]?: Promise<Data>;
+      [id in string | number | symbol]?: { promise: Promise<Data> };
     };
     promisesResponses: {
-      [id in string | number | symbol]?: { p: Promise<Data> };
+      [id in string | number | symbol]?: { promise: Promise<Data> };
     };
     delayPromise?: Promise<{
       queuedClusters: QueuedCluster<Id, RawData, Data>[];
     } | void>;
     queue: {
-      singles: {
-        id: Id;
-        key: string;
-        hasFoundData: boolean;
-        skipCallingOne?: boolean;
-      }[];
+      singles: QueueItem<Id>[];
       keySet: Set<string>;
     };
   };
@@ -277,6 +278,38 @@ const serializeId = (id, options: CollmiseOptions<any, any>): string => {
   return JSON.stringify(id);
 };
 
+const getCacheOrFoundPromiseOnKey = async <Id, RawData, Data>(
+  id: Id,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData, id: Id) => Data;
+  },
+  inner: InnerOptions<Id, RawData, Data>
+) => {
+  const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
+
+  const cacheOptions = getCacheOptions(options, inner);
+  if (cacheOptions.useCache && typeof options.findCachedData === "function") {
+    const cachedData = await options.findCachedData(id);
+    if (isNotEmpty(cachedData)) {
+      return {
+        hasFoundData: true as const,
+        promise: cachedData! as Data,
+      };
+    }
+  }
+  const key = serializeId(id, options);
+  const result = getFoundPromiseOnKey(key, cacheOptions, inner);
+  if (result) {
+    return {
+      hasFoundData: true as const,
+      promise: result.promise,
+    };
+  }
+  return {
+    hasFoundData: false,
+  };
+};
+
 const getFoundPromiseOnKey = <Id, RawData, Data>(
   key: string,
   cacheOptions: RequiredCacheOptions,
@@ -286,27 +319,59 @@ const getFoundPromiseOnKey = <Id, RawData, Data>(
     cacheOptions.joinConcurrentRequests &&
     inner.req.currentlyRunningPromises[key]
   ) {
-    return { promise: inner.req.currentlyRunningPromises[key]! };
+    return inner.req.currentlyRunningPromises[key]!;
   }
   if (cacheOptions.useResponseCache && inner.req.promisesResponses[key]) {
-    return { promise: inner.req.promisesResponses[key]!.p };
+    return inner.req.promisesResponses[key]!;
   }
   return null;
 };
 
+const addInQueue = <Id, RawData, Data>(
+  item: QueueItem<Id>,
+  options: CollmiseOptions<Id, RawData, Data> & {
+    dataTransformer?: (data: RawData, id: Id) => Data;
+  },
+  inner: InnerOptions<Id, RawData, Data>
+) => {
+  const { id, key, hasFoundData, skipCallingOne } = item;
+  let insertNew = false;
+  const containsSameId = inner.req.queue.keySet.has(key);
+  if (options.consistentDataOnSameIds === false || !containsSameId) {
+    insertNew = true;
+  } else if (containsSameId) {
+    const found = inner.req.queue.singles.find(e => {
+      if (e.key !== key) return false;
+      if (skipCallingOne && !e.skipCallingOne) return false;
+      return true;
+    });
+    if (!found) insertNew = true;
+  }
+  if (insertNew) {
+    inner.req.queue.keySet.add(key);
+    inner.req.queue.singles.push({
+      id,
+      hasFoundData,
+      key,
+      skipCallingOne,
+    });
+  }
+};
 const getSingleRequest = <Id, RawData, Data>(
   id: Id,
   options: CollmiseOptions<Id, RawData, Data> & {
     dataTransformer?: (data: RawData, id: Id) => Data;
   },
   inner: InnerOptions<Id, RawData, Data>,
-  skipCallingOne: boolean
+  skipCallingOne: boolean,
+  isCallingMultipleRequired?: boolean
 ): CollmiseSingle<Id, RawData, Data>[
   | "request"
   | "submitToCollectors"] => async (...args): Promise<Data> => {
   const getPromise = args[0] as Parameters<
     CollmiseSingle<Id, RawData, Data>["request"]
   >[0];
+
   if (!skipCallingOne && !getPromise) {
     throw new Error("Collmise: argument for request is required");
   }
@@ -320,27 +385,14 @@ const getSingleRequest = <Id, RawData, Data>(
 
   const cacheOptions = getCacheOptions(options, inner);
 
-  const isNotEmpty = options.isNonEmptyData || isNonEmptyData;
-
   let hasFoundData = false;
   let foundedDataPromsie: Data | Promise<Data> | undefined = undefined;
 
-  const isCallingMultipleRequired = false;
-
   if (!skipCallingOne) {
-    if (cacheOptions.useCache && typeof options.findCachedData === "function") {
-      const cachedData = await options.findCachedData(id);
-      if (isNotEmpty(cachedData)) {
-        hasFoundData = true;
-        foundedDataPromsie = cachedData! as Data;
-      }
-    }
-    if (!hasFoundData) {
-      const result = getFoundPromiseOnKey(key, cacheOptions, inner);
-      if (result) {
-        hasFoundData = true;
-        foundedDataPromsie = result.promise;
-      }
+    const result = await getCacheOrFoundPromiseOnKey(id, options, inner);
+    if (result.hasFoundData) {
+      hasFoundData = true;
+      foundedDataPromsie = result.promise!;
     }
   }
 
@@ -353,18 +405,14 @@ const getSingleRequest = <Id, RawData, Data>(
       ? 1
       : options.collectingTimeoutMS;
   const hasCollectors = inner.collectors.length > 0;
-  if (
-    !inner.req.queue.keySet.has(key) ||
-    options.consistentDataOnSameIds === false
-  ) {
-    inner.req.queue.keySet.add(key);
-    inner.req.queue.singles.push({
-      id,
-      hasFoundData,
-      key,
-      skipCallingOne,
-    });
-  }
+
+  const queueItem: QueueItem<Id> = {
+    id,
+    hasFoundData,
+    key,
+    skipCallingOne,
+  };
+  addInQueue(queueItem, options, inner);
 
   if (collectingTimeoutMS > 0 && hasCollectors && !inner.req.delayPromise) {
     inner.req.delayPromise = getDelayPromise(
@@ -373,14 +421,12 @@ const getSingleRequest = <Id, RawData, Data>(
       inner
     );
   }
-
   const result = await inner.req.delayPromise;
 
   let matchedQueues: QueuedCluster<Id, RawData, Data>[] = [];
   if (result) {
     matchedQueues = result.queuedClusters.filter(e => e.keySet.has(key));
   }
-
   if (
     hasFoundData &&
     (matchedQueues.length === 0 ||
@@ -417,7 +463,7 @@ const getSingleRequest = <Id, RawData, Data>(
   }
 
   if (skipCallingOne) {
-    throw new Error(`no gathering collector found`);
+    throw new Error(`No gathering collector found for key ${key}`);
   }
 
   const promResult = getFoundPromiseOnKey(key, cacheOptions, inner);
@@ -457,7 +503,10 @@ const getDelayPromise = <Id, RawData, Data>(
       for (const collectorInfo of inner.collectors) {
         const useAll = collectorInfo.collector.alwaysCallCollector === true;
         const singles = useAll ? inner.req.queue.singles : uncached;
-        const singleIds = singles.map(e => e.id);
+        const singleIds = uniquelizeIds(
+          singles.map(e => e.id),
+          options
+        );
         const clusteredIds: ReturnType<Exclude<
           typeof collectorInfo["collector"]["splitInIdClusters"],
           undefined
@@ -510,6 +559,22 @@ const getDelayPromise = <Id, RawData, Data>(
   });
 };
 
+const uniquelizeIds = <Id>(
+  ids: Id[],
+  options: CollmiseOptions<Id, any, any>
+): Id[] => {
+  if (options.consistentDataOnSameIds === false) return ids;
+  const uniquelizedIds: Id[] = [];
+  const usedKeys = new Set();
+  for (const id of ids) {
+    const key = serializeId(id, options);
+    if (usedKeys.has(key)) continue;
+    uniquelizedIds.push(id);
+    usedKeys.add(key);
+  }
+  return uniquelizedIds;
+};
+
 const transformFoundedOneData = <Id, RawData, Data = RawData>(
   id: Id,
   oneData: Data | null | undefined,
@@ -557,13 +622,15 @@ const saveSinglePromise = async <Id, RawData, Data>(
   const key = serializeId(id, options);
   try {
     if (cacheOptions.cacheResponse) {
-      inner.req.currentlyRunningPromises[key] = singlePromise;
+      inner.req.currentlyRunningPromises[key] = {
+        promise: singlePromise,
+      };
     }
     const data = await singlePromise;
     saveResponse(key, singlePromise, cacheOptions, options, inner);
     return data;
   } finally {
-    if (inner.req.currentlyRunningPromises[key] === singlePromise) {
+    if (inner.req.currentlyRunningPromises[key]?.promise === singlePromise) {
       delete inner.req.currentlyRunningPromises[key];
     }
   }
@@ -579,12 +646,12 @@ const saveResponse = (
   const responseCacheTimeoutMS = options.responseCacheTimeoutMS || 0;
   if (cacheOptions.cacheResponse && responseCacheTimeoutMS > 0) {
     inner.req.promisesResponses[key] = {
-      p: promise,
+      promise: promise,
     };
     setTimeout(() => {
       if (
         inner.req.promisesResponses[key] &&
-        inner.req.promisesResponses[key]!.p === promise
+        inner.req.promisesResponses[key]!.promise === promise
       ) {
         delete inner.req.promisesResponses[key];
       }
@@ -745,6 +812,7 @@ const getCollectorRequest = <
             id,
             options,
             copiedInner,
+            true,
             true
           )(() => Promise.reject("fake function"))
         );
